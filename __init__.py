@@ -4,6 +4,7 @@ import random
 import subprocess
 import datetime
 import json
+import shutil
 from aqt import mw
 from aqt.qt import QAction, qconnect
 from aqt.utils import showInfo
@@ -64,7 +65,7 @@ def get_repeat_count(stability_days):
         return 1
 
 
-def generate_todays_audio():
+def generate_todays_video():
     if not mw.col:
         showInfo("Anki collection is not loaded.")
         return
@@ -91,7 +92,7 @@ def generate_todays_audio():
         showInfo("No cards found for tomorrow.")
         return
 
-    audio_entries = []
+    playlist_items = []
     
     # 2. Iterate through cards, check stability, and apply repeat rules
     for cid in card_ids:
@@ -103,109 +104,149 @@ def generate_todays_audio():
         note = card.note()
         fields = dict(zip(note.keys(), note.values()))
         
-        sentence_text = fields.get("Sentence", "N/A")
-        word_text = fields.get("Word", "N/A")
-        
-        print(f"[{word_text}] '{sentence_text}' -> Stability: {stability_days}, Repeats: {repeat_count}")
+        sentence_text = fields.get("Sentence", "").strip()
+        word_text = fields.get("Word", "").strip()
         
         sentence_audio_field = fields.get("Sentence Audio", "")
         match = re.search(r"\[sound:(.*?)\]", sentence_audio_field)
         if match:
             filename = match.group(1)
             for _ in range(repeat_count):
-                audio_entries.append(filename)
+                playlist_items.append({
+                    "filename": filename,
+                    "sentence": sentence_text
+                })
 
-    print(f"Total audio tracks after applying low-stability repetition rules: {len(audio_entries)}")
-
-    if not audio_entries:
+    if not playlist_items:
         showInfo("No audio files found in the Sentence Audio fields for today's cards.")
         return
 
-    # 3. Randomize the playlist so repetitions are non-sequential
-    random.shuffle(audio_entries)
+    # 3. Randomize the playlist
+    random.shuffle(playlist_items)
 
-    # 4. Get Anki media folder path
     media_folder = col.media.dir()
-
-    # 4b. Generate a temporary 0.5-second silent MP3 file
     ffmpeg_executable = "/opt/homebrew/bin/ffmpeg"
-    silence_path = os.path.join(media_folder, "temp_silence_0.5s.mp3")
-    silence_cmd = [
-        ffmpeg_executable,
-        "-y",
-        "-f", "lavfi",
-        "-i", "anullsrc=r=44100:cl=stereo",
-        "-t", "0.5",
-        "-q:a", "9",
-        silence_path
-    ]
-    try:
-        subprocess.run(silence_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError as e:
-        print(f"Warning: Could not generate silence file: {e}")
+    ffprobe_executable = "/opt/homebrew/bin/ffprobe"
+    temp_dir = os.path.join(media_folder, "anki_video_temp")
+    os.makedirs(temp_dir, exist_ok=True)
 
-    # 5. Create a text file list for ffmpeg concatenation with silence inserted between tracks
-    list_file_path = os.path.join(media_folder, "ffmpeg_list.txt")
-    valid_files_count = 0
+    # 4. Filter out items where audio files don't exist
+    valid_items = []
+    for item in playlist_items:
+        full_path = os.path.join(media_folder, item["filename"])
+        if os.path.exists(full_path):
+            valid_items.append({
+                "path": full_path,
+                "sentence": item["sentence"]
+            })
 
-    with open(list_file_path, "w", encoding="utf-8") as f:
-        for filename in audio_entries:
-            full_path = os.path.join(media_folder, filename)
-            if os.path.exists(full_path):
-                safe_path = full_path.replace("'", "'\\''")
-                f.write(f"file '{safe_path}'\n")
-                valid_files_count += 1
-                
-                # Insert 0.5s silence after each track if available
-                if os.path.exists(silence_path):
-                    safe_silence_path = silence_path.replace("'", "'\\''")
-                    f.write(f"file '{safe_silence_path}'\n")
-            else:
-                print(f"Warning: Audio file not found on disk: {filename}")
-
-    if valid_files_count == 0:
-        showInfo("No valid audio files found on disk to merge.")
-        if os.path.exists(list_file_path):
-            os.remove(list_file_path)
-        if os.path.exists(silence_path):
-            os.remove(silence_path)
+    if not valid_items:
+        showInfo("No valid audio files found on disk.")
+        shutil.rmtree(temp_dir)
         return
 
-    # 6. Set output to ~/Downloads with date and precise timestamp
+    print(f"Processing {len(valid_items)} audio items into master track...")
+
+    # 5. Create master audio concat list and probe exact durations
+    audio_list_file = os.path.join(temp_dir, "audio_concat_list.txt")
+    with open(audio_list_file, "w", encoding="utf-8") as f:
+        for item in valid_items:
+            safe_path = item["path"].replace("'", "'\\''")
+            f.write(f"file '{safe_path}'\n")
+
+    master_audio = os.path.join(temp_dir, "master_audio.aac")
+    
+    # Concat all audio into a single clean AAC stream with async resampling
+    audio_concat_cmd = [
+        ffmpeg_executable, "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", audio_list_file,
+        "-c:a", "aac", "-b:a", "192k",
+        "-ar", "44100", "-af", "aresample=async=1",
+        master_audio
+    ]
+    subprocess.run(audio_concat_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 6. Build precise timeline intervals and escape text for FFmpeg drawtext
+    current_time = 0.0
+    timeline_filters = []
+
+    font_path = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
+    if not os.path.exists(font_path):
+        font_path = "/System/Library/Fonts/Hiragino Sans GB.ttc"
+
+    for idx, item in enumerate(valid_items):
+        probe_cmd = [
+            ffprobe_executable,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            item["path"]
+        ]
+        try:
+            result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            duration = float(result.stdout.strip())
+        except Exception:
+            duration = 3.0  # Fallback duration if probe fails
+
+        start_time = current_time
+        end_time = current_time + duration
+        current_time = end_time
+
+        clean_sentence = re.sub(r'<[^>]+>', '', item["sentence"])
+        safe_sentence = clean_sentence.replace("\\", "\\\\").replace("'", "").replace(":", "\\:").replace("%", "\\%")
+
+        in_label = "[v_in]" if idx == 0 else f"[v{idx-1}]"
+        out_label = f"[v{idx}]" if idx < len(valid_items) - 1 else "[v_out]"
+
+        filter_str = (
+            f"{in_label}drawtext=fontfile='{font_path}':text='{safe_sentence}':"
+            f"fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2:"
+            f"enable='between(t,{start_time},{end_time})'{out_label}"
+        )
+        timeline_filters.append(filter_str)
+
+    full_filter_chain = f"[0:v]null[v_in];" + ";".join(timeline_filters)
+
+    # 7. Set output paths for both Video and Audio in ~/Downloads
     timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     downloads_dir = os.path.expanduser("~/Downloads")
-    output_mp3 = os.path.join(downloads_dir, f"{timestamp_str}_sentence_audio.mp3")
-    
-    print(f"Stitching {valid_files_count} audio files with 0.5s pauses into {output_mp3}...")
+    output_mp4 = os.path.join(downloads_dir, f"{timestamp_str}_review_video.mp4")
+    output_m4a = os.path.join(downloads_dir, f"{timestamp_str}_review_audio.m4a")
 
-    ffmpeg_cmd = [
-        ffmpeg_executable,
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        list_file_path,
-        "-c:a",
-        "libmp3lame",
-        output_mp3,
+    print(f"Generating single-pass master video into {output_mp4}...")
+
+    video_build_cmd = [
+        ffmpeg_executable, "-y",
+        "-f", "lavfi",
+        "-i", f"color=c=black:s=1280x720:r=30:d={current_time}",
+        "-i", master_audio,
+        "-filter_complex", full_filter_chain,
+        "-map", "[v_out]",
+        "-map", "1:a",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "22",
+        "-c:a", "copy",
+        "-shortest",
+        output_mp4
     ]
 
     try:
-        subprocess.run(ffmpeg_cmd, check=True)
-        showInfo(f"Success! Created timestamped audio file with pauses in your Downloads:\n{output_mp3}")
+        subprocess.run(video_build_cmd, check=True)
+        
+        # Copy/Export the master audio track as a standalone .m4a file
+        shutil.copy(master_audio, output_m4a)
+        
+        showInfo(f"Success! Created both files in your Downloads:\n\n1. Video:\n{output_mp4}\n\n2. Audio:\n{output_m4a}")
     except subprocess.CalledProcessError as e:
-        showInfo(f"Error running ffmpeg: {e}")
+        showInfo(f"Error building media with ffmpeg: {e}")
     finally:
-        # Clean up temp files
-        if os.path.exists(list_file_path):
-            os.remove(list_file_path)
-        if os.path.exists(silence_path):
-            os.remove(silence_path)
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
 
 
 # Add a menu item under Anki's "Tools" menu
-action = QAction("Generate Randomized Low-Stability Audio", mw)
-qconnect(action.triggered, generate_todays_audio)
+action = QAction("Generate Randomized Review Video & Audio", mw)
+qconnect(action.triggered, generate_todays_video)
 mw.form.menuTools.addAction(action)
