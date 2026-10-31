@@ -108,44 +108,11 @@ def generate_todays_epub_overlay():
     all_new_card_ids = list(col.find_cards(new_query))
     tomorrow_new_card_ids = all_new_card_ids[:10]
 
-    card_ids = review_card_ids + tomorrow_new_card_ids
+    print(f"Found {len(review_card_ids)} reviews for tomorrow and {len(tomorrow_new_card_ids)} new cards.")
 
-    print(f"Found {len(review_card_ids)} reviews for tomorrow and {len(tomorrow_new_card_ids)} new cards ({len(card_ids)} total).")
-
-    if not card_ids:
+    if not review_card_ids and not tomorrow_new_card_ids:
         showInfo("No cards found for tomorrow.")
         return
-
-    playlist_items = []
-    
-    # 2. Iterate through cards, check stability, and apply repeat rules
-    for cid in card_ids:
-        card = col.get_card(cid)
-        
-        stability_days = get_card_stability(card)
-        repeat_count = get_repeat_count(stability_days)
-        
-        note = card.note()
-        fields = dict(zip(note.keys(), note.values()))
-        
-        sentence_text = fields.get("Sentence", "").strip()
-        sentence_audio_field = fields.get("Sentence Audio", "")
-        
-        match = re.search(r"\[sound:(.*?)\]", sentence_audio_field)
-        if match:
-            filename = match.group(1)
-            for _ in range(repeat_count):
-                playlist_items.append({
-                    "filename": filename,
-                    "sentence": sentence_text
-                })
-
-    if not playlist_items:
-        showInfo("No audio files found in the Sentence Audio fields for today's cards.")
-        return
-
-    # 3. Randomize the playlist
-    random.shuffle(playlist_items)
 
     media_folder = col.media.dir()
     ffmpeg_executable = "/opt/homebrew/bin/ffmpeg"
@@ -153,86 +120,178 @@ def generate_todays_epub_overlay():
     temp_dir = os.path.join(media_folder, "anki_epub_temp")
     os.makedirs(temp_dir, exist_ok=True)
 
-    # 4. Filter out items where audio files don't exist
-    valid_items = []
-    for item in playlist_items:
-        full_path = os.path.join(media_folder, item["filename"])
-        if os.path.exists(full_path):
-            valid_items.append({
-                "path": full_path,
-                "sentence": item["sentence"]
-            })
+    # Helper function to extract audio items from a list of card IDs
+    def extract_audio_items(card_ids_list):
+        items = []
+        for cid in card_ids_list:
+            card = col.get_card(cid)
+            stability_days = get_card_stability(card)
+            repeat_count = get_repeat_count(stability_days)
+            
+            note = card.note()
+            fields = dict(zip(note.keys(), note.values()))
+            
+            sentence_text = fields.get("Sentence", "").strip()
+            sentence_audio_field = fields.get("Sentence Audio", "")
+            
+            match = re.search(r"\[sound:(.*?)\]", sentence_audio_field)
+            if match:
+                filename = match.group(1)
+                full_path = os.path.join(media_folder, filename)
+                if os.path.exists(full_path):
+                    # Sequential repetition for low stability cards
+                    for _ in range(repeat_count):
+                        items.append({
+                            "path": full_path,
+                            "sentence": sentence_text
+                        })
+        return items
 
-    if not valid_items:
-        showInfo("No valid audio files found on disk.")
+    # 2. Build separate playlists for reviews and new cards
+    review_playlist = extract_audio_items(review_card_ids)
+    new_playlist = extract_audio_items(tomorrow_new_card_ids)
+
+    if not review_playlist and not new_playlist:
+        showInfo("No valid audio files found on disk for today's cards.")
         shutil.rmtree(temp_dir)
         return
 
-    print(f"Processing {len(valid_items)} audio items into master track...")
+    # Create silence assets using ffmpeg
+    silence_1s_path = os.path.join(temp_dir, "silence_1s.m4a")
+    silence_5s_path = os.path.join(temp_dir, "silence_5s.m4a")
 
-    # 5. Create master audio concat list
-    audio_list_file = os.path.join(temp_dir, "audio_concat_list.txt")
-    with open(audio_list_file, "w", encoding="utf-8") as f:
-        for item in valid_items:
-            safe_path = item["path"].replace("'", "'\\''")
-            f.write(f"file '{safe_path}'\n")
+    subprocess.run([
+        ffmpeg_executable, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        "-t", "1", "-c:a", "aac", "-b:a", "192k", silence_1s_path
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    subprocess.run([
+        ffmpeg_executable, "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        "-t", "5", "-c:a", "aac", "-b:a", "192k", silence_5s_path
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 3. Assemble sentence blocks and merge trailing silence into each sentence file
+    blocks = []
+
+    def prepare_blocks(segment_items, is_last_segment):
+        for i, item in enumerate(segment_items):
+            if i < len(segment_items) - 1:
+                trailing = silence_1s_path
+            else:
+                # Last item in segment gets a 5s transition or final silence
+                trailing = silence_5s_path
+            
+            blocks.append({
+                "path": item["path"],
+                "sentence": item["sentence"],
+                "trailing_silence": trailing
+            })
+
+    has_reviews = bool(review_playlist)
+    has_new = bool(new_playlist)
+
+    if has_reviews:
+        prepare_blocks(review_playlist, is_last_segment=not has_new)
+
+    if has_new:
+        prepare_blocks(new_playlist, is_last_segment=True)
+
+    playlist_sequence = []
+
+    # Optional initial 5s silence if there are no reviews but we have new cards
+    if not has_reviews and has_new:
+        playlist_sequence.append({
+            "path": silence_5s_path,
+            "is_sentence": False
+        })
+
+    print(f"Merging sentence audio with trailing silence for {len(blocks)} items...")
+
+    for idx, block in enumerate(blocks):
+        combined_path = os.path.join(temp_dir, f"combined_{idx}.m4a")
+        # Concatenate sentence audio + trailing silence into one file so the highlight stays active during the pause
+        subprocess.run([
+            ffmpeg_executable, "-y",
+            "-i", block["path"],
+            "-i", block["trailing_silence"],
+            "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[outa]",
+            "-map", "[outa]",
+            "-c:a", "aac", "-b:a", "192k",
+            "-ar", "44100",
+            combined_path
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        playlist_sequence.append({
+            "path": combined_path,
+            "sentence": block["sentence"],
+            "is_sentence": True
+        })
+
+    print(f"Processing master track with {len(playlist_sequence)} audio segments...")
+
+    # 4. Use FFmpeg filter_complex to concatenate all combined audio inputs reliably
     master_audio = os.path.join(temp_dir, "master_audio.m4a")
     
-    # Concat all audio into a single clean M4A/AAC stream
-    audio_concat_cmd = [
-        ffmpeg_executable, "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", audio_list_file,
-        "-c:a", "aac", "-b:a", "192k",
-        "-ar", "44100", "-af", "aresample=async=1",
-        master_audio
-    ]
-    subprocess.run(audio_concat_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ffmpeg_cmd = [ffmpeg_executable, "-y"]
+    for seq_item in playlist_sequence:
+        ffmpeg_cmd.extend(["-i", seq_item["path"]])
 
-    # 6. Probe durations and build XHTML + SMIL timelines
+    filter_parts = [f"[{i}:a]" for i in range(len(playlist_sequence))]
+    filter_str = "".join(filter_parts) + f"concat=n={len(playlist_sequence)}:v=0:a=1[outa]"
+
+    ffmpeg_cmd.extend([
+        "-filter_complex", filter_str,
+        "-map", "[outa]",
+        "-c:a", "aac", "-b:a", "192k",
+        "-ar", "44100",
+        master_audio
+    ])
+    subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 5. Probe durations and build XHTML + SMIL timelines cleanly
     current_time = 0.0
     xhtml_paragraphs = []
     smil_paras = []
+    sentence_idx = 0
 
-    for idx, item in enumerate(valid_items):
+    for seq_item in playlist_sequence:
         probe_cmd = [
             ffprobe_executable,
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
-            item["path"]
+            seq_item["path"]
         ]
         try:
             result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
             duration = float(result.stdout.strip())
         except Exception:
-            duration = 3.0  # Fallback duration if probe fails
+            duration = 1.0  # Fallback duration
 
         start_time = current_time
         end_time = current_time + duration
         current_time = end_time
 
-        # Clean sentence and escape for XML
-        clean_sentence = re.sub(r'<[^>]+>', '', item["sentence"])
-        escaped_sentence = html.escape(clean_sentence)
+        if seq_item["is_sentence"]:
+            clean_sentence = re.sub(r'<[^>]+>', '', seq_item["sentence"])
+            escaped_sentence = html.escape(clean_sentence)
+            p_id = f"s{sentence_idx}"
+            sentence_idx += 1
 
-        p_id = f"s{idx}"
-        
-        # Build XHTML paragraph snippet
-        xhtml_paragraphs.append(f'    <p id="{p_id}">{escaped_sentence}</p>')
-
-        # Build SMIL par snippet using explicit 's' suffix format required by validation regex
-        smil_paras.append(
-            f'    <par id="p{idx}">\n'
-            f'      <text src="text.xhtml#{p_id}"/>\n'
-            f'      <audio src="master_audio.m4a" clipBegin="{format_duration_smil(start_time)}" clipEnd="{format_duration_smil(end_time)}"/>\n'
-            f'    </par>'
-        )
+            xhtml_paragraphs.append(f'    <p id="{p_id}">{escaped_sentence}</p>')
+            smil_paras.append(
+                f'    <par id="p{sentence_idx}">\n'
+                f'      <text src="text.xhtml#{p_id}"/>\n'
+                f'      <audio src="master_audio.m4a" clipBegin="{format_duration_smil(start_time)}" clipEnd="{format_duration_smil(end_time)}"/>\n'
+                f'    </par>'
+            )
+        else:
+            # Standalone leading silence items advance the timeline without text
+            pass
 
     total_duration_opf_str = format_duration_opf(current_time)
 
-    # 7. Assemble EPUB components
+    # 6. Assemble EPUB components
     timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     downloads_dir = os.path.expanduser("~/Downloads")
     output_epub = os.path.join(downloads_dir, f"{timestamp_str}_review_overlay.epub")
@@ -241,11 +300,9 @@ def generate_todays_epub_overlay():
     os.makedirs(os.path.join(epub_build_dir, "META-INF"), exist_ok=True)
     os.makedirs(os.path.join(epub_build_dir, "OEBPS"), exist_ok=True)
 
-    # mimetype (must be uncompressed and first in zip)
     with open(os.path.join(epub_build_dir, "mimetype"), "w", encoding="utf-8") as f:
         f.write("application/epub+zip")
 
-    # META-INF/container.xml
     container_xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n'
@@ -257,7 +314,6 @@ def generate_todays_epub_overlay():
     with open(os.path.join(epub_build_dir, "META-INF", "container.xml"), "w", encoding="utf-8") as f:
         f.write(container_xml)
 
-    # OEBPS/text.xhtml
     xhtml_content = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE html>\n'
@@ -280,7 +336,6 @@ def generate_todays_epub_overlay():
     with open(os.path.join(epub_build_dir, "OEBPS", "text.xhtml"), "w", encoding="utf-8") as f:
         f.write(xhtml_content)
 
-    # OEBPS/overlay.smil
     smil_content = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<smil xmlns="http://www.w3.org/ns/SMIL" version="3.0" xmlns:epub="http://www.idpf.org/2007/ops">\n'
@@ -294,7 +349,6 @@ def generate_todays_epub_overlay():
     with open(os.path.join(epub_build_dir, "OEBPS", "overlay.smil"), "w", encoding="utf-8") as f:
         f.write(smil_content)
 
-    # OEBPS/nav.xhtml (Required for EPUB3 navigation)
     nav_content = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE html>\n'
@@ -313,7 +367,6 @@ def generate_todays_epub_overlay():
     with open(os.path.join(epub_build_dir, "OEBPS", "nav.xhtml"), "w", encoding="utf-8") as f:
         f.write(nav_content)
 
-    # OEBPS/content.opf
     unique_uuid = str(uuid.uuid4())
     datetime_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
     opf_content = (
@@ -341,18 +394,15 @@ def generate_todays_epub_overlay():
     with open(os.path.join(epub_build_dir, "OEBPS", "content.opf"), "w", encoding="utf-8") as f:
         f.write(opf_content)
 
-    # Copy master audio into OEBPS folder
     shutil.copy(master_audio, os.path.join(epub_build_dir, "OEBPS", "master_audio.m4a"))
 
-    # 8. Zip into standard .epub container
+    # 7. Zip into standard .epub container
     print(f"Packaging EPUB file into {output_epub}...")
     try:
         with zipfile.ZipFile(output_epub, "w") as epub_zip:
-            # mimetype must be stored uncompressed and placed first
             mimetype_path = os.path.join(epub_build_dir, "mimetype")
             epub_zip.write(mimetype_path, "mimetype", compress_type=zipfile.ZIP_STORED)
 
-            # Write remaining files
             for root, dirs, files in os.walk(epub_build_dir):
                 for file in files:
                     if file == "mimetype":
@@ -361,7 +411,7 @@ def generate_todays_epub_overlay():
                     arcname = os.path.relpath(full_file_path, epub_build_dir)
                     epub_zip.write(full_file_path, arcname, compress_type=zipfile.ZIP_DEFLATED)
 
-        showInfo(f"Success! Created EPUB3 file with Media Overlays in your Downloads:\n\n{output_epub}")
+        showInfo(f"Success! Created EPUB3 file with synced audio and clean text in your Downloads:\n\n{output_epub}")
     except Exception as e:
         showInfo(f"Error packaging EPUB file: {e}")
     finally:
