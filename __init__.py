@@ -5,6 +5,9 @@ import subprocess
 import datetime
 import json
 import shutil
+import zipfile
+import html
+import uuid
 from aqt import mw
 from aqt.qt import QAction, qconnect
 from aqt.utils import showInfo
@@ -65,7 +68,28 @@ def get_repeat_count(stability_days):
         return 1
 
 
-def generate_todays_video():
+def format_duration_smil(seconds):
+    """
+    Returns a valid SMIL3 clock value with the 's' suffix (e.g., '12.345s').
+    """
+    return f"{seconds:.3f}s"
+
+
+def format_duration_opf(seconds):
+    """
+    Returns a valid SMIL3 clock value format for OPF metadata (e.g., 'HH:MM:SS.mmm' or 'MM:SS.mmm').
+    """
+    mins, secs = divmod(seconds, 60)
+    hours, mins = divmod(mins, 60)
+    if hours > 0:
+        return f"{int(hours)}:{int(mins):02d}:{secs:06.3f}"
+    elif mins > 0:
+        return f"{int(mins):02d}:{secs:06.3f}"
+    else:
+        return f"00:{secs:06.3f}"
+
+
+def generate_todays_epub_overlay():
     if not mw.col:
         showInfo("Anki collection is not loaded.")
         return
@@ -105,9 +129,8 @@ def generate_todays_video():
         fields = dict(zip(note.keys(), note.values()))
         
         sentence_text = fields.get("Sentence", "").strip()
-        word_text = fields.get("Word", "").strip()
-        
         sentence_audio_field = fields.get("Sentence Audio", "")
+        
         match = re.search(r"\[sound:(.*?)\]", sentence_audio_field)
         if match:
             filename = match.group(1)
@@ -127,7 +150,7 @@ def generate_todays_video():
     media_folder = col.media.dir()
     ffmpeg_executable = "/opt/homebrew/bin/ffmpeg"
     ffprobe_executable = "/opt/homebrew/bin/ffprobe"
-    temp_dir = os.path.join(media_folder, "anki_video_temp")
+    temp_dir = os.path.join(media_folder, "anki_epub_temp")
     os.makedirs(temp_dir, exist_ok=True)
 
     # 4. Filter out items where audio files don't exist
@@ -147,16 +170,16 @@ def generate_todays_video():
 
     print(f"Processing {len(valid_items)} audio items into master track...")
 
-    # 5. Create master audio concat list and probe exact durations
+    # 5. Create master audio concat list
     audio_list_file = os.path.join(temp_dir, "audio_concat_list.txt")
     with open(audio_list_file, "w", encoding="utf-8") as f:
         for item in valid_items:
             safe_path = item["path"].replace("'", "'\\''")
             f.write(f"file '{safe_path}'\n")
 
-    master_audio = os.path.join(temp_dir, "master_audio.aac")
+    master_audio = os.path.join(temp_dir, "master_audio.m4a")
     
-    # Concat all audio into a single clean AAC stream with async resampling
+    # Concat all audio into a single clean M4A/AAC stream
     audio_concat_cmd = [
         ffmpeg_executable, "-y",
         "-f", "concat", "-safe", "0",
@@ -167,13 +190,10 @@ def generate_todays_video():
     ]
     subprocess.run(audio_concat_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 6. Build precise timeline intervals and escape text for FFmpeg drawtext
+    # 6. Probe durations and build XHTML + SMIL timelines
     current_time = 0.0
-    timeline_filters = []
-
-    font_path = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
-    if not os.path.exists(font_path):
-        font_path = "/System/Library/Fonts/Hiragino Sans GB.ttc"
+    xhtml_paragraphs = []
+    smil_paras = []
 
     for idx, item in enumerate(valid_items):
         probe_cmd = [
@@ -193,60 +213,163 @@ def generate_todays_video():
         end_time = current_time + duration
         current_time = end_time
 
+        # Clean sentence and escape for XML
         clean_sentence = re.sub(r'<[^>]+>', '', item["sentence"])
-        safe_sentence = clean_sentence.replace("\\", "\\\\").replace("'", "").replace(":", "\\:").replace("%", "\\%")
+        escaped_sentence = html.escape(clean_sentence)
 
-        in_label = "[v_in]" if idx == 0 else f"[v{idx-1}]"
-        out_label = f"[v{idx}]" if idx < len(valid_items) - 1 else "[v_out]"
+        p_id = f"s{idx}"
+        
+        # Build XHTML paragraph snippet
+        xhtml_paragraphs.append(f'    <p id="{p_id}">{escaped_sentence}</p>')
 
-        filter_str = (
-            f"{in_label}drawtext=fontfile='{font_path}':text='{safe_sentence}':"
-            f"fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2:"
-            f"enable='between(t,{start_time},{end_time})'{out_label}"
+        # Build SMIL par snippet using explicit 's' suffix format required by validation regex
+        smil_paras.append(
+            f'    <par id="p{idx}">\n'
+            f'      <text src="text.xhtml#{p_id}"/>\n'
+            f'      <audio src="master_audio.m4a" clipBegin="{format_duration_smil(start_time)}" clipEnd="{format_duration_smil(end_time)}"/>\n'
+            f'    </par>'
         )
-        timeline_filters.append(filter_str)
 
-    full_filter_chain = f"[0:v]null[v_in];" + ";".join(timeline_filters)
+    total_duration_opf_str = format_duration_opf(current_time)
 
-    # 7. Set output paths for both Video and Audio in ~/Downloads
+    # 7. Assemble EPUB components
     timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     downloads_dir = os.path.expanduser("~/Downloads")
-    output_mp4 = os.path.join(downloads_dir, f"{timestamp_str}_review_video.mp4")
-    output_m4a = os.path.join(downloads_dir, f"{timestamp_str}_review_audio.m4a")
+    output_epub = os.path.join(downloads_dir, f"{timestamp_str}_review_overlay.epub")
 
-    print(f"Generating single-pass master video into {output_mp4}...")
+    epub_build_dir = os.path.join(temp_dir, "epub_root")
+    os.makedirs(os.path.join(epub_build_dir, "META-INF"), exist_ok=True)
+    os.makedirs(os.path.join(epub_build_dir, "OEBPS"), exist_ok=True)
 
-    video_build_cmd = [
-        ffmpeg_executable, "-y",
-        "-f", "lavfi",
-        "-i", f"color=c=black:s=1280x720:r=30:d={current_time}",
-        "-i", master_audio,
-        "-filter_complex", full_filter_chain,
-        "-map", "[v_out]",
-        "-map", "1:a",
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "22",
-        "-c:a", "copy",
-        "-shortest",
-        output_mp4
-    ]
+    # mimetype (must be uncompressed and first in zip)
+    with open(os.path.join(epub_build_dir, "mimetype"), "w", encoding="utf-8") as f:
+        f.write("application/epub+zip")
 
+    # META-INF/container.xml
+    container_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n'
+        '  <rootfiles>\n'
+        '    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>\n'
+        '  </rootfiles>\n'
+        '</container>'
+    )
+    with open(os.path.join(epub_build_dir, "META-INF", "container.xml"), "w", encoding="utf-8") as f:
+        f.write(container_xml)
+
+    # OEBPS/text.xhtml
+    xhtml_content = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE html>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml" lang="ja">\n'
+        '<head>\n'
+        '  <meta charset="utf-8"/>\n'
+        '  <title>Daily Review Sentences</title>\n'
+        '  <style>\n'
+        '    body { font-family: sans-serif; padding: 2em; line-height: 1.8; font-size: 1.4em; }\n'
+        '    p { margin-bottom: 1.5em; }\n'
+        '    .-epub-media-overlay-active { background-color: #ffd700; color: #000; }\n'
+        '  </style>\n'
+        '</head>\n'
+        '<body>\n'
+        '  <h1>Daily Review</h1>\n'
+        + "\n".join(xhtml_paragraphs) + "\n"
+        '</body>\n'
+        '</html>'
+    )
+    with open(os.path.join(epub_build_dir, "OEBPS", "text.xhtml"), "w", encoding="utf-8") as f:
+        f.write(xhtml_content)
+
+    # OEBPS/overlay.smil
+    smil_content = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<smil xmlns="http://www.w3.org/ns/SMIL" version="3.0" xmlns:epub="http://www.idpf.org/2007/ops">\n'
+        '  <body>\n'
+        '    <seq id="review_seq" epub:textref="text.xhtml" epub:type="bodymatter">\n'
+        + "\n".join(smil_paras) + "\n"
+        '    </seq>\n'
+        '  </body>\n'
+        '</smil>'
+    )
+    with open(os.path.join(epub_build_dir, "OEBPS", "overlay.smil"), "w", encoding="utf-8") as f:
+        f.write(smil_content)
+
+    # OEBPS/nav.xhtml (Required for EPUB3 navigation)
+    nav_content = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE html>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="ja">\n'
+        '<head><meta charset="utf-8"/><title>Navigation</title></head>\n'
+        '<body>\n'
+        '  <nav epub:type="toc" id="toc">\n'
+        '    <h1>Table of Contents</h1>\n'
+        '    <ol>\n'
+        '      <li><a href="text.xhtml">Review Sentences</a></li>\n'
+        '    </ol>\n'
+        '  </nav>\n'
+        '</body>\n'
+        '</html>'
+    )
+    with open(os.path.join(epub_build_dir, "OEBPS", "nav.xhtml"), "w", encoding="utf-8") as f:
+        f.write(nav_content)
+
+    # OEBPS/content.opf
+    unique_uuid = str(uuid.uuid4())
+    datetime_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    opf_content = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">\n'
+        '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
+        f'    <dc:identifier id="uid">urn:uuid:{unique_uuid}</dc:identifier>\n'
+        f'    <dc:title>Anki Daily Review - {timestamp_str}</dc:title>\n'
+        '    <dc:language>ja</dc:language>\n'
+        f'    <meta property="dcterms:modified">{datetime_iso}</meta>\n'
+        f'    <meta property="media:duration" refines="#overlay">{total_duration_opf_str}</meta>\n'
+        f'    <meta property="media:duration">{total_duration_opf_str}</meta>\n'
+        '  </metadata>\n'
+        '  <manifest>\n'
+        '    <item id="nav" href="nav.xhtml" properties="nav" media-type="application/xhtml+xml"/>\n'
+        '    <item id="text" href="text.xhtml" media-type="application/xhtml+xml" media-overlay="overlay"/>\n'
+        '    <item id="overlay" href="overlay.smil" media-type="application/smil+xml"/>\n'
+        '    <item id="audio" href="master_audio.m4a" media-type="audio/mp4"/>\n'
+        '  </manifest>\n'
+        '  <spine>\n'
+        '    <itemref idref="text"/>\n'
+        '  </spine>\n'
+        '</package>'
+    )
+    with open(os.path.join(epub_build_dir, "OEBPS", "content.opf"), "w", encoding="utf-8") as f:
+        f.write(opf_content)
+
+    # Copy master audio into OEBPS folder
+    shutil.copy(master_audio, os.path.join(epub_build_dir, "OEBPS", "master_audio.m4a"))
+
+    # 8. Zip into standard .epub container
+    print(f"Packaging EPUB file into {output_epub}...")
     try:
-        subprocess.run(video_build_cmd, check=True)
-        
-        # Copy/Export the master audio track as a standalone .m4a file
-        shutil.copy(master_audio, output_m4a)
-        
-        showInfo(f"Success! Created both files in your Downloads:\n\n1. Video:\n{output_mp4}\n\n2. Audio:\n{output_m4a}")
-    except subprocess.CalledProcessError as e:
-        showInfo(f"Error building media with ffmpeg: {e}")
+        with zipfile.ZipFile(output_epub, "w") as epub_zip:
+            # mimetype must be stored uncompressed and placed first
+            mimetype_path = os.path.join(epub_build_dir, "mimetype")
+            epub_zip.write(mimetype_path, "mimetype", compress_type=zipfile.ZIP_STORED)
+
+            # Write remaining files
+            for root, dirs, files in os.walk(epub_build_dir):
+                for file in files:
+                    if file == "mimetype":
+                        continue
+                    full_file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(full_file_path, epub_build_dir)
+                    epub_zip.write(full_file_path, arcname, compress_type=zipfile.ZIP_DEFLATED)
+
+        showInfo(f"Success! Created EPUB3 file with Media Overlays in your Downloads:\n\n{output_epub}")
+    except Exception as e:
+        showInfo(f"Error packaging EPUB file: {e}")
     finally:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
 
 # Add a menu item under Anki's "Tools" menu
-action = QAction("Generate Randomized Review Video & Audio", mw)
-qconnect(action.triggered, generate_todays_video)
+action = QAction("Generate EPUB3 Review with Media Overlays", mw)
+qconnect(action.triggered, generate_todays_epub_overlay)
 mw.form.menuTools.addAction(action)
