@@ -9,6 +9,7 @@ import html
 from aqt import mw
 from aqt.qt import QAction, qconnect
 from aqt.utils import showInfo
+from aqt.operations import QueryOp
 
 
 def get_card_stability(card):
@@ -72,21 +73,17 @@ def format_duration_lrc(seconds):
     """
     mins, secs = divmod(seconds, 60)
     hours, mins = divmod(mins, 60)
-    # If total duration exceeds an hour, include hours as [hh:mm:ss.xx]
     if hours > 0:
         total_mins = int(hours * 60 + mins)
         return f"[{total_mins:02d}:{secs:05.2f}]"
     return f"[{int(mins):02d}:{secs:05.2f}]"
 
 
-def generate_todays_audio_lrc():
-    if not mw.col:
-        showInfo("Anki collection is not loaded.")
-        return
-
-    col = mw.col
-    print("Finding cards directly via Anki backend...")
-
+def generate_audio_lrc_task(col):
+    """
+    Runs in a background thread via QueryOp, updating the progress label via mw.taskman.run_on_main.
+    """
+    mw.taskman.run_on_main(lambda: mw.progress.update(label="Searching for tomorrow's cards..."))
     deck_filter = 'deck:"Kaishi 1.5k"'
 
     # 1a. Find review cards scheduled for tomorrow (prop:due=1)
@@ -98,11 +95,12 @@ def generate_todays_audio_lrc():
     all_new_card_ids = list(col.find_cards(new_query))
     tomorrow_new_card_ids = all_new_card_ids[:10]
 
-    print(f"Found {len(review_card_ids)} reviews for tomorrow and {len(tomorrow_new_card_ids)} new cards.")
+    mw.taskman.run_on_main(lambda: mw.progress.update(
+        label=f"Found {len(review_card_ids)} reviews and {len(tomorrow_new_card_ids)} new cards."
+    ))
 
     if not review_card_ids and not tomorrow_new_card_ids:
-        showInfo("No cards found for tomorrow.")
-        return
+        return {"success": False, "message": "No cards found for tomorrow."}
 
     media_folder = col.media.dir()
     ffmpeg_executable = "/opt/homebrew/bin/ffmpeg"
@@ -110,7 +108,6 @@ def generate_todays_audio_lrc():
     temp_dir = os.path.join(media_folder, "anki_audio_temp")
     os.makedirs(temp_dir, exist_ok=True)
 
-    # Helper function to extract audio items from a list of card IDs
     def extract_audio_items(card_ids_list):
         items = []
         for cid in card_ids_list:
@@ -129,7 +126,6 @@ def generate_todays_audio_lrc():
                 filename = match.group(1)
                 full_path = os.path.join(media_folder, filename)
                 if os.path.exists(full_path):
-                    # Sequential repetition for low stability cards
                     for _ in range(repeat_count):
                         items.append({
                             "path": full_path,
@@ -138,15 +134,17 @@ def generate_todays_audio_lrc():
         return items
 
     # 2. Build separate playlists for reviews and new cards
+    mw.taskman.run_on_main(lambda: mw.progress.update(label="Extracting card audio items..."))
     review_playlist = extract_audio_items(review_card_ids)
     new_playlist = extract_audio_items(tomorrow_new_card_ids)
 
     if not review_playlist and not new_playlist:
-        showInfo("No valid audio files found on disk for today's cards.")
-        shutil.rmtree(temp_dir)
-        return
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        return {"success": False, "message": "No valid audio files found on disk for today's cards."}
 
     # Create silence assets using ffmpeg
+    mw.taskman.run_on_main(lambda: mw.progress.update(label="Creating silence assets..."))
     silence_1s_path = os.path.join(temp_dir, "silence_1s.m4a")
     silence_5s_path = os.path.join(temp_dir, "silence_5s.m4a")
 
@@ -187,14 +185,13 @@ def generate_todays_audio_lrc():
 
     playlist_sequence = []
 
-    # Optional initial 5s silence if there are no reviews but we have new cards
     if not has_reviews and has_new:
         playlist_sequence.append({
             "path": silence_5s_path,
             "is_sentence": False
         })
 
-    print(f"Merging sentence audio with trailing silence for {len(blocks)} items...")
+    mw.taskman.run_on_main(lambda: mw.progress.update(label=f"Merging audio with trailing silence ({len(blocks)} items)..."))
 
     for idx, block in enumerate(blocks):
         combined_path = os.path.join(temp_dir, f"combined_{idx}.m4a")
@@ -215,7 +212,7 @@ def generate_todays_audio_lrc():
             "is_sentence": True
         })
 
-    print(f"Processing master track with {len(playlist_sequence)} audio segments...")
+    mw.taskman.run_on_main(lambda: mw.progress.update(label=f"Processing master track with {len(playlist_sequence)} segments..."))
 
     # 4. Use FFmpeg filter_complex to concatenate all combined audio inputs reliably
     master_audio = os.path.join(temp_dir, "master_audio.m4a")
@@ -237,10 +234,10 @@ def generate_todays_audio_lrc():
     subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # 5. Probe durations and build LRC timestamps
+    mw.taskman.run_on_main(lambda: mw.progress.update(label="Probing durations and building LRC timestamps..."))
     current_time = 0.0
     lrc_lines = []
 
-    # Optional LRC Metadata Headers
     timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     lrc_lines.append(f"[ti:Anki Daily Review - {timestamp_str}]")
     lrc_lines.append("[ar:Anki FSRS]")
@@ -259,7 +256,7 @@ def generate_todays_audio_lrc():
             result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
             duration = float(result.stdout.strip())
         except Exception:
-            duration = 1.0  # Fallback duration
+            duration = 1.0
 
         start_time = current_time
         end_time = current_time + duration
@@ -270,31 +267,59 @@ def generate_todays_audio_lrc():
             timestamp_tag = format_duration_lrc(start_time)
             lrc_lines.append(f"{timestamp_tag}{clean_sentence}")
         else:
-            # Standalone silence advances the timeline silently
             pass
 
     # 6. Save final files to ~/Downloads
+    mw.taskman.run_on_main(lambda: mw.progress.update(label="Saving final files to Downloads..."))
     downloads_dir = os.path.expanduser("~/Downloads")
     output_audio = os.path.join(downloads_dir, f"{timestamp_str}_review.m4a")
     output_lrc = os.path.join(downloads_dir, f"{timestamp_str}_review.lrc")
 
     try:
-        # Copy master audio to Downloads
         shutil.copy(master_audio, output_audio)
-
-        # Write LRC file to Downloads
         with open(output_lrc, "w", encoding="utf-8") as f:
             f.write("\n".join(lrc_lines))
-
-        showInfo(f"Success! Created Audio + LRC files in your Downloads:\n\n• {output_audio}\n• {output_lrc}")
     except Exception as e:
-        showInfo(f"Error saving files to Downloads: {e}")
-    finally:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
+        return {"success": False, "message": f"Error saving files to Downloads: {e}"}
+    
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+
+    return {
+        "success": True, 
+        "audio": output_audio, 
+        "lrc": output_lrc
+    }
+
+
+def on_generation_complete(result):
+    """
+    Triggered safely back on Anki's main thread when background processing finishes.
+    """
+    if not result:
+        return
+    if result.get("success"):
+        showInfo(f"Success! Created Audio + LRC files in your Downloads:\n\n• {result['audio']}\n• {result['lrc']}")
+    else:
+        showInfo(result.get("message", "An unknown error occurred."))
+
+
+def start_generation_with_progress():
+    if not mw.col:
+        showInfo("Anki collection is not loaded.")
+        return
+
+    op = QueryOp(
+        parent=mw,
+        op=lambda col: generate_audio_lrc_task(col),
+        success=on_generation_complete
+    )
+    op.with_progress(label="Preparing generation...").run_in_background()
 
 
 # Add a menu item under Anki's "Tools" menu
 action = QAction("Generate Audio + LRC Review Files", mw)
-qconnect(action.triggered, generate_todays_audio_lrc)
+qconnect(action.triggered, start_generation_with_progress)
 mw.form.menuTools.addAction(action)
