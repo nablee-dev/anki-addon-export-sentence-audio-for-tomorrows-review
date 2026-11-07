@@ -90,8 +90,8 @@ def generate_audio_lrc_task(col):
     review_query = f"{deck_filter} prop:due=1".strip()
     review_card_ids = list(col.find_cards(review_query))
 
-    # 1b. Find new cards and slice the first 10
-    new_query = f"{deck_filter} is:new".strip()
+    # 1b. Find new cards (excluding suspended ones) and slice the first 10
+    new_query = f"{deck_filter} is:new -is:suspended".strip()
     all_new_card_ids = list(col.find_cards(new_query))
     tomorrow_new_card_ids = all_new_card_ids[:10]
 
